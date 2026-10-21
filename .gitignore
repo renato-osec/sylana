@@ -1,0 +1,25 @@
+# Rust
+target/
+
+# CMake / emitter
+emitter/build/
+emitter/build-*/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# engine outputs
+klee-out*/
+ko_*/
+*.linked.bc
+*.istats
+
+# uv / pytest
+uv.lock
+.pytest_cache/
+
+# klee-session fork build
+klee-session/result-klee-session

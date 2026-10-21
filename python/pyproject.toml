@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sylana"
+version = "0.1.0"
+description = "Symbolic execution of Solana sBPF programs with a solders-friendly API"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+
+# solana/solders are optional: the API accepts their Message/Account objects
+# when installed, but the engine and tests never require them.
+[project.optional-dependencies]
+solana = ["solders>=0.21", "solana>=0.34"]
+dev = ["pytest>=7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["sylana"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

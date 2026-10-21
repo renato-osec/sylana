@@ -1,0 +1,922 @@
+diff --git a/include/llvmbpf.hpp b/include/llvmbpf.hpp
+index f6a8e8b..375e19c 100644
+--- a/include/llvmbpf.hpp
++++ b/include/llvmbpf.hpp
+@@ -35,6 +35,14 @@ struct array_map_descriptor {
+ 	uint32_t max_entries = 0;
+ };
+ 
++// A statically discovered sBPF CALL_REG destination. guest_address is the
++// relocated VM address held in the source register; instruction_pc is its
++// instruction index in the normalized bytecode loaded into this VM.
++struct sbpf_callx_target {
++	uint64_t guest_address = 0;
++	uint32_t instruction_pc = 0;
++};
++
+ class llvm_bpf_jit_context;
+ 
+ // The JITed function signature.
+@@ -62,6 +70,14 @@ class llvmbpf_vm {
+ 	// return 0 on success
+ 	int load_code(const void *code, size_t code_len) noexcept;
+ 
++	// Configure valid indirect sBPF call destinations before compilation.
++	int set_sbpf_callx_targets(
++		const std::vector<sbpf_callx_target> &targets) noexcept;
++	// Select the deployed Solana instruction semantics (currently V0-V2).
++	int set_sbpf_version(uint32_t version) noexcept;
++	// Select the first instruction without creating a synthetic local call.
++	int set_entry_pc(uint32_t instruction_pc) noexcept;
++
+ 	// unload the bytecode and remove the JIT/AOT compiled results
+ 	void unload_code() noexcept;
+ 
+@@ -132,6 +148,9 @@ class llvmbpf_vm {
+ 
+ 	std::vector<std::optional<external_function> > ext_funcs;
+ 	std::unordered_map<uint64_t, array_map_descriptor> array_maps;
++	std::vector<sbpf_callx_target> sbpf_callx_targets;
++	uint32_t sbpf_version = 0;
++	uint32_t entry_pc = 0;
+ 
+ 	std::unique_ptr<llvm_bpf_jit_context> jit_ctx;
+ 
+diff --git a/src/compiler.cpp b/src/compiler.cpp
+index 3ec98b9..c33c125 100644
+--- a/src/compiler.cpp
++++ b/src/compiler.cpp
+@@ -209,6 +209,8 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 	const std::string &func_name, bool is_gpu)
+ {
+ 	const bool kernel_compatible_mode = vm.kernel_compatible_mode_;
++	const bool manual_stack_frames = vm.sbpf_version >= 1;
++	const bool sbpf_v2 = vm.sbpf_version == 2;
+ 	SPDLOG_DEBUG(
+ 		"Generating module: patch_map_val_at_compile_time={}, with arguments={}, kernel_compatible_mode={}, func_name={}, is_gpu={}",
+ 		patch_map_val_at_compile_time, main_func_with_arguments,
+@@ -263,6 +265,16 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 		  Type::getInt64Ty(*context), Type::getInt64Ty(*context),
+ 		  Type::getInt64Ty(*context) },
+ 		false);
++	FunctionType *invalidCallxFuncTy = FunctionType::get(
++		Type::getInt64Ty(*context), { Type::getInt64Ty(*context) }, false);
++	Function *invalidCallxFunc = Function::Create(
++		invalidCallxFuncTy, Function::ExternalLinkage,
++		"sbpf_unresolved_callx", jitModule.get());
++	FunctionType *arithmeticCheckFuncTy = FunctionType::get(
++		Type::getVoidTy(*context), { Type::getInt64Ty(*context) }, false);
++	Function *arithmeticCheckFunc = Function::Create(
++		arithmeticCheckFuncTy, Function::ExternalLinkage,
++		"sbpf_arithmetic_check", jitModule.get());
+ 
+ 	for (const auto &name : extFuncNames) {
+ 		Function *currFunc = Function::Create(
+@@ -272,10 +284,10 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 			name, jitModule.get());
+ 		extFunc[name] = currFunc;
+ 	}
+-	std::map<uint16_t, Function *> kernelPseudoCallFunc;
+-	uint16_t codegen_end_pc = insts.size();
++	std::map<uint32_t, Function *> kernelPseudoCallFunc;
++	uint32_t codegen_end_pc = insts.size();
+ 	if (kernel_compatible_mode) {
+-		for (uint16_t i = 0; i < insts.size(); i++) {
++		for (uint32_t i = 0; i < insts.size(); i++) {
+ 			const auto &curr = insts[i];
+ 			if ((curr.opcode != EBPF_OP_CALL &&
+ 			     curr.opcode != (EBPF_OP_CALL | 0x8)) ||
+@@ -291,7 +303,7 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 						std::to_string(i),
+ 					llvm::inconvertibleErrorCode());
+ 			}
+-			const auto target_pc = static_cast<uint16_t>(dstBlkId);
++			const auto target_pc = static_cast<uint32_t>(dstBlkId);
+ 			codegen_end_pc = std::min(codegen_end_pc, target_pc);
+ 			auto symbol_name = kernel_pseudo_call_symbol(
+ 				static_cast<uint32_t>(target_pc));
+@@ -308,7 +320,13 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 	std::vector<bool> blockBegin(insts.size(), false);
+ 	// Split the blocks
+ 	blockBegin[0] = true;
+-	for (uint16_t i = 0; i < insts.size(); i++) {
++	if (vm.entry_pc >= insts.size()) {
++		return llvm::make_error<llvm::StringError>(
++			"Entry PC is outside loaded code",
++			llvm::inconvertibleErrorCode());
++	}
++	blockBegin[vm.entry_pc] = true;
++	for (uint32_t i = 0; i < insts.size(); i++) {
+ 		auto curr = insts[i];
+ 		SPDLOG_TRACE("check pc {} opcode={} ", i,
+ 			     (uint16_t)curr.opcode);
+@@ -326,6 +344,14 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 			blockBegin[i + curr.offset + 1] = true;
+ 		}
+ 	}
++	for (const auto &target : vm.sbpf_callx_targets) {
++		if (target.instruction_pc >= blockBegin.size()) {
++			return llvm::make_error<llvm::StringError>(
++				"sBPF callx target pc is outside loaded code",
++				llvm::inconvertibleErrorCode());
++		}
++		blockBegin[target.instruction_pc] = true;
++	}
+ 	FunctionType *func_ty;
+ 	if (main_func_with_arguments) {
+ 		// For SPIR-V/CUDA, use address space 1 (Global) for kernel parameters
+@@ -363,9 +389,9 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 	std::vector<BasicBlock *> allBlocks;
+ 	// Stack used to save return address and saved registers
+ 	Value *callStack, *callItemCnt;
++	BasicBlock *setupBlock;
+ 	{
+-		BasicBlock *setupBlock =
+-			BasicBlock::Create(*context, "setupBlock", bpf_func);
++		setupBlock = BasicBlock::Create(*context, "setupBlock", bpf_func);
+ 		allBlocks.push_back(setupBlock);
+ 		IRBuilder<> builder(setupBlock);
+ 		// Create registers
+@@ -375,10 +401,10 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 				builder.getInt64Ty(), nullptr,
+ 				"r" + std::to_string(i)));
+ 		}
+-		if (kernel_compatible_mode) {
+-			for (auto *reg : regs) {
+-				builder.CreateStore(builder.getInt64(0), reg);
+-			}
++		// Solana starts r0..r9 at zero. r1 is replaced with the input
++		// pointer below, while r10 is initialized from the VM stack.
++		for (int i = 0; i <= 9; i++) {
++			builder.CreateStore(builder.getInt64(0), regs[i]);
+ 		}
+ 		// Create stack
+ 		// For SPIR-V/CUDA, use array type to avoid VLA issues
+@@ -426,7 +452,7 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 			if (is_gpu) {
+ 				auto callStackArrayTy = llvm::ArrayType::get(
+ 					builder.getPtrTy(),
+-					CALL_STACK_SIZE * 5);
++					CALL_STACK_SIZE * 6);
+ 				callStack =
+ 					builder.CreateAlloca(callStackArrayTy,
+ 							      nullptr,
+@@ -435,7 +461,7 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 				callStack = builder.CreateAlloca(
+ 					builder.getPtrTy(),
+ 					builder.getInt32(
+-						CALL_STACK_SIZE * 5),
++						CALL_STACK_SIZE * 6),
+ 					"callStack");
+ 			}
+ 			callItemCnt = builder.CreateAlloca(
+@@ -444,27 +470,23 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 			builder.CreateStore(builder.getInt64(0), callItemCnt);
+ 		}
+ 		if (main_func_with_arguments) {
+-			// Get args of uint64_t bpf_main(uint64_t, uint64_t)
++			// Solana exposes only the input address in r1. Keep the second
++			// host argument for ABI compatibility, but do not place it in r2.
+ 			llvm::Argument *mem = bpf_func->getArg(0);
+ 			// Write memory address into r1
+ 			builder.CreateStore(mem, regs[1]);
+-			if (!kernel_compatible_mode) {
+-				llvm::Argument *mem_len = bpf_func->getArg(1);
+-				// Write memory len into r2
+-				builder.CreateStore(mem_len, regs[2]);
+-			}
+ 		}
+ 	}
+ 
+ 	// These blocks are the next instructions of the returning target of
+ 	// local functions
+-	std::map<uint16_t, BlockAddress *> localFuncRetBlks;
++	std::map<uint32_t, BlockAddress *> localFuncRetBlks;
+ 	// Prepare basic blocks
+-	std::map<uint16_t, BasicBlock *> instBlocks;
++	std::map<uint32_t, BasicBlock *> instBlocks;
+ 	{
+ 		IRBuilder<> builder(*context);
+ 
+-		for (uint16_t i = 0; i < codegen_end_pc; i++) {
++		for (uint32_t i = 0; i < codegen_end_pc; i++) {
+ 			if (blockBegin[i]) {
+ 				// Create a block
+ 				auto currBlk = BasicBlock::Create(
+@@ -476,9 +498,10 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 
+ 				// Indicating that these block is the next
+ 				// instruction of a local func call
+-				if (i > 1 &&
+-				    insts[i - 1].opcode == EBPF_OP_CALL &&
+-				    insts[i - 1].src == 0x01) {
++				if (i > 0 &&
++				    ((insts[i - 1].opcode == EBPF_OP_CALL &&
++				      insts[i - 1].src == 0x01) ||
++				     insts[i - 1].opcode == (EBPF_OP_CALL | 0x8))) {
+ 					auto blockAddr =
+ 						llvm::BlockAddress::get(
+ 							bpf_func, currBlk);
+@@ -487,6 +510,7 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 			}
+ 		}
+ 	}
++	IRBuilder<>(setupBlock).CreateBr(instBlocks.at(vm.entry_pc));
+ 
+ 	// Basic block used to exit the eBPF program
+ 	// will read r0 and return it
+@@ -509,8 +533,8 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 		localRetBlk = BasicBlock::Create(
+ 			*context, "localFuncReturnBlock", bpf_func);
+ 		{
+-			// The most top one is the returning address, followed by r6,
+-			// r7, r8, r9
++			// The top item is the return address, followed by r6-r9 and
++			// the exact caller frame pointer.
+ 			IRBuilder<> builder(localRetBlk);
+ 			Value *count = builder.CreateLoad(
+ 				builder.getInt64Ty(), callItemCnt);
+@@ -536,19 +560,18 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 									i - 4)) })),
+ 					regs[i]);
+ 			}
++			builder.CreateStore(
++				builder.CreateLoad(
++					builder.getInt64Ty(),
++					builder.CreateGEP(
++						builder.getInt64Ty(), callStack,
++						{ builder.CreateSub(
++							count, builder.getInt64(6)) })),
++				regs[10]);
+ 			builder.CreateStore(
+ 				builder.CreateSub(count,
+-						  builder.getInt64(5)),
++						  builder.getInt64(6)),
+ 				callItemCnt);
+-			// Restore data stack
+-			// r10 += stack_size
+-			builder.CreateStore(
+-				builder.CreateAdd(
+-					builder.CreateLoad(
+-						builder.getInt64Ty(),
+-						regs[10]),
+-					builder.getInt64(STACK_SIZE)),
+-				regs[10]);
+ 			auto indrBr = builder.CreateIndirectBr(targetAddr);
+ 			for (const auto &item : localFuncRetBlks) {
+ 				indrBr->addDestination(
+@@ -559,7 +582,7 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 	// Iterate over instructions
+ 	BasicBlock *currBB = instBlocks[0];
+ 	IRBuilder<> builder(currBB);
+-	for (uint16_t pc = 0; pc < codegen_end_pc; pc++) {
++	for (uint32_t pc = 0; pc < codegen_end_pc; pc++) {
+ 		auto inst = insts[pc];
+ 		if (blockBegin[pc]) {
+ 			if (auto itr = instBlocks.find(pc);
+@@ -591,7 +614,7 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 				[&](Value *dst_val, Value *src_val) {
+ 					return builder.CreateAdd(dst_val,
+ 								 src_val);
+-				});
++				}, vm.sbpf_version < 2);
+ 
+ 			break;
+ 		}
+@@ -602,9 +625,12 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 			emitALUWithDstAndSrc(
+ 				inst, builder, &regs[0],
+ 				[&](Value *dst_val, Value *src_val) {
+-					return builder.CreateSub(dst_val,
+-								 src_val);
+-				});
++					if (sbpf_v2 &&
++					    (inst.opcode == EBPF_OP_SUB_IMM ||
++					     inst.opcode == EBPF_OP_SUB64_IMM))
++						return builder.CreateSub(src_val, dst_val);
++					return builder.CreateSub(dst_val, src_val);
++				}, vm.sbpf_version < 2);
+ 			break;
+ 		}
+ 		case EBPF_OP_MUL64_IMM:
+@@ -617,7 +643,7 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 					return builder.CreateBinOp(
+ 						Instruction::BinaryOps::Mul,
+ 						dst_val, src_val);
+-				});
++				}, vm.sbpf_version < 2);
+ 			break;
+ 		}
+ 		case EBPF_OP_DIV64_IMM:
+@@ -719,6 +745,146 @@ this conversion.
+ 				break;
+ 			}
+ 		}
++		case SBPF_OP_HOR64_IMM: {
++			Value *dst = builder.CreateLoad(builder.getInt64Ty(),
++							regs[inst.dst]);
++			Value *high = builder.getInt64(
++				static_cast<uint64_t>(static_cast<uint32_t>(inst.imm)) << 32);
++			builder.CreateStore(builder.CreateOr(dst, high), regs[inst.dst]);
++			break;
++		}
++		case SBPF_OP_LMUL32_IMM:
++		case SBPF_OP_LMUL32_REG:
++		case SBPF_OP_LMUL64_IMM:
++		case SBPF_OP_LMUL64_REG:
++		case SBPF_OP_UHMUL64_IMM:
++		case SBPF_OP_UHMUL64_REG:
++		case SBPF_OP_SHMUL64_IMM:
++		case SBPF_OP_SHMUL64_REG:
++		case SBPF_OP_UDIV32_IMM:
++		case SBPF_OP_UDIV32_REG:
++		case SBPF_OP_UDIV64_IMM:
++		case SBPF_OP_UDIV64_REG:
++		case SBPF_OP_UREM32_IMM:
++		case SBPF_OP_UREM32_REG:
++		case SBPF_OP_UREM64_IMM:
++		case SBPF_OP_UREM64_REG:
++		case SBPF_OP_SDIV32_IMM:
++		case SBPF_OP_SDIV32_REG:
++		case SBPF_OP_SDIV64_IMM:
++		case SBPF_OP_SDIV64_REG:
++		case SBPF_OP_SREM32_IMM:
++		case SBPF_OP_SREM32_REG:
++		case SBPF_OP_SREM64_IMM:
++		case SBPF_OP_SREM64_REG: {
++			const bool is64 =
++				inst.opcode == SBPF_OP_LMUL64_IMM ||
++				inst.opcode == SBPF_OP_LMUL64_REG ||
++				inst.opcode == SBPF_OP_UHMUL64_IMM ||
++				inst.opcode == SBPF_OP_UHMUL64_REG ||
++				inst.opcode == SBPF_OP_SHMUL64_IMM ||
++				inst.opcode == SBPF_OP_SHMUL64_REG ||
++				inst.opcode == SBPF_OP_UDIV64_IMM ||
++				inst.opcode == SBPF_OP_UDIV64_REG ||
++				inst.opcode == SBPF_OP_UREM64_IMM ||
++				inst.opcode == SBPF_OP_UREM64_REG ||
++				inst.opcode == SBPF_OP_SDIV64_IMM ||
++				inst.opcode == SBPF_OP_SDIV64_REG ||
++				inst.opcode == SBPF_OP_SREM64_IMM ||
++				inst.opcode == SBPF_OP_SREM64_REG;
++			const bool source_is_reg = (inst.opcode & 0x08) != 0;
++			const bool signed_op =
++				inst.opcode == SBPF_OP_SHMUL64_IMM ||
++				inst.opcode == SBPF_OP_SHMUL64_REG ||
++				inst.opcode == SBPF_OP_SDIV32_IMM ||
++				inst.opcode == SBPF_OP_SDIV32_REG ||
++				inst.opcode == SBPF_OP_SDIV64_IMM ||
++				inst.opcode == SBPF_OP_SDIV64_REG ||
++				inst.opcode == SBPF_OP_SREM32_IMM ||
++				inst.opcode == SBPF_OP_SREM32_REG ||
++				inst.opcode == SBPF_OP_SREM64_IMM ||
++				inst.opcode == SBPF_OP_SREM64_REG;
++			Type *ty = is64 ? builder.getInt64Ty() : builder.getInt32Ty();
++			Value *dst = builder.CreateLoad(builder.getInt64Ty(), regs[inst.dst]);
++			if (!is64)
++				dst = builder.CreateTrunc(dst, ty);
++			Value *src;
++			if (source_is_reg) {
++				src = builder.CreateLoad(builder.getInt64Ty(), regs[inst.src]);
++				if (!is64)
++					src = builder.CreateTrunc(src, ty);
++			} else if (!is64) {
++				src = builder.getInt32(inst.imm);
++			} else if (signed_op ||
++				   inst.opcode == SBPF_OP_LMUL64_IMM) {
++				src = builder.getInt64(static_cast<int64_t>(inst.imm));
++			} else {
++				src = builder.getInt64(static_cast<uint32_t>(inst.imm));
++			}
++
++			Value *result;
++			if (inst.opcode == SBPF_OP_LMUL32_IMM ||
++			    inst.opcode == SBPF_OP_LMUL32_REG ||
++			    inst.opcode == SBPF_OP_LMUL64_IMM ||
++			    inst.opcode == SBPF_OP_LMUL64_REG) {
++				result = builder.CreateMul(dst, src);
++			} else if (inst.opcode == SBPF_OP_UHMUL64_IMM ||
++				   inst.opcode == SBPF_OP_UHMUL64_REG ||
++				   inst.opcode == SBPF_OP_SHMUL64_IMM ||
++				   inst.opcode == SBPF_OP_SHMUL64_REG) {
++				Type *wide = builder.getInt128Ty();
++				Value *wide_dst = signed_op ? builder.CreateSExt(dst, wide) :
++							      builder.CreateZExt(dst, wide);
++				Value *wide_src = signed_op ? builder.CreateSExt(src, wide) :
++							      builder.CreateZExt(src, wide);
++				Value *product = builder.CreateMul(wide_dst, wide_src);
++				Value *shift = ConstantInt::get(wide, 64);
++				Value *high = signed_op ?
++					builder.CreateAShr(product, shift) :
++					builder.CreateLShr(product, shift);
++				result = builder.CreateTrunc(high, builder.getInt64Ty());
++			} else {
++				Value *zero = ConstantInt::get(ty, 0);
++				Value *one = ConstantInt::get(ty, 1);
++				Value *is_zero = builder.CreateICmpEQ(src, zero);
++				Value *is_overflow = ConstantInt::getFalse(*context);
++				if (signed_op) {
++					Value *minimum = is64 ? builder.getInt64(INT64_MIN) :
++							      builder.getInt32(INT32_MIN);
++					Value *minus_one = is64 ? builder.getInt64(-1) :
++							       builder.getInt32(-1);
++					is_overflow = builder.CreateAnd(
++						builder.CreateICmpEQ(dst, minimum),
++						builder.CreateICmpEQ(src, minus_one));
++				}
++				Value *invalid = builder.CreateOr(is_zero, is_overflow);
++				builder.CreateCall(
++					arithmeticCheckFuncTy, arithmeticCheckFunc,
++					{ builder.CreateZExt(invalid, builder.getInt64Ty()) });
++				Value *safe_src = builder.CreateSelect(invalid, one, src);
++				const bool remainder =
++					inst.opcode == SBPF_OP_UREM32_IMM ||
++					inst.opcode == SBPF_OP_UREM32_REG ||
++					inst.opcode == SBPF_OP_UREM64_IMM ||
++					inst.opcode == SBPF_OP_UREM64_REG ||
++					inst.opcode == SBPF_OP_SREM32_IMM ||
++					inst.opcode == SBPF_OP_SREM32_REG ||
++					inst.opcode == SBPF_OP_SREM64_IMM ||
++					inst.opcode == SBPF_OP_SREM64_REG;
++				Value *calculated;
++				if (remainder)
++					calculated = signed_op ? builder.CreateSRem(dst, safe_src) :
++								 builder.CreateURem(dst, safe_src);
++				else
++					calculated = signed_op ? builder.CreateSDiv(dst, safe_src) :
++								 builder.CreateUDiv(dst, safe_src);
++				result = builder.CreateSelect(invalid, zero, calculated);
++			}
++			if (!is64)
++				result = builder.CreateZExt(result, builder.getInt64Ty());
++			builder.CreateStore(result, regs[inst.dst]);
++			break;
++		}
+ 		case EBPF_OP_OR64_IMM:
+ 		case EBPF_OP_OR_IMM:
+ 		case EBPF_OP_OR64_REG:
+@@ -896,7 +1062,10 @@ this conversion.
+ 			} else {
+ 				result = src_val;
+ 			}
+-			emitStoreALUResult(inst, &regs[0], builder, result);
++			emitStoreALUResult(
++				inst, &regs[0], builder, result,
++				sbpf_v2 && inst.opcode == EBPF_OP_MOV_REG &&
++					inst.offset == 0);
+ 			break;
+ 		}
+ 
+@@ -1319,6 +1488,88 @@ this conversion.
+ 			// Work around for clang producing instructions
+ 			// that we don't support
+ 		case EBPF_OP_CALL | 0x8: {
++			// sBPF CALL_REG (callx) names the target register in imm.
++			// Dispatch relocated guest text addresses to statically
++			// discovered function-entry blocks while preserving the same
++			// call-frame semantics as a direct BPF-to-BPF call.
++			if (inst.opcode == (EBPF_OP_CALL | 0x8)) {
++				if (kernel_compatible_mode) {
++					return llvm::make_error<llvm::StringError>(
++						"sBPF callx is not supported in kernel-compatible mode",
++						llvm::inconvertibleErrorCode());
++				}
++				if (inst.imm < 0 || inst.imm > 10) {
++					return llvm::make_error<llvm::StringError>(
++						"sBPF callx has an invalid register at pc " +
++							std::to_string(pc),
++						llvm::inconvertibleErrorCode());
++				}
++
++				Value *nextPos = builder.CreateAdd(
++					builder.CreateLoad(builder.getInt64Ty(),
++							   callItemCnt),
++					builder.getInt64(6));
++				builder.CreateStore(nextPos, callItemCnt);
++				assert(localFuncRetBlks.contains(pc + 1));
++				builder.CreateStore(
++					localFuncRetBlks[pc + 1],
++					builder.CreateGEP(
++						builder.getPtrTy(), callStack,
++						{ builder.CreateSub(
++							nextPos, builder.getInt64(1)) }));
++				for (int i = 6; i <= 9; i++) {
++					builder.CreateStore(
++						builder.CreateLoad(builder.getInt64Ty(),
++									   regs[i]),
++						builder.CreateGEP(
++							builder.getInt64Ty(), callStack,
++							{ builder.CreateSub(
++								nextPos,
++								builder.getInt64(i - 4)) }));
++				}
++				builder.CreateStore(
++					builder.CreateLoad(builder.getInt64Ty(), regs[10]),
++					builder.CreateGEP(
++						builder.getInt64Ty(), callStack,
++						{ builder.CreateSub(nextPos,
++								    builder.getInt64(6)) }));
++				if (!manual_stack_frames) {
++					builder.CreateStore(
++						builder.CreateSub(
++							builder.CreateLoad(builder.getInt64Ty(),
++										   regs[10]),
++							builder.getInt64(EBPF_STACK_SIZE)),
++						regs[10]);
++				}
++
++				auto *invalidBlk = BasicBlock::Create(
++					*context, "invalid_callx_" + std::to_string(pc),
++					bpf_func);
++				IRBuilder<> invalidBuilder(invalidBlk);
++				Value *target = builder.CreateLoad(
++					builder.getInt64Ty(), regs[inst.imm]);
++				auto *invalidResult = invalidBuilder.CreateCall(
++					invalidCallxFuncTy, invalidCallxFunc, { target });
++				invalidBuilder.CreateStore(invalidResult, regs[0]);
++				invalidBuilder.CreateBr(exitBlk);
++				auto *dispatch = builder.CreateSwitch(
++					target, invalidBlk, vm.sbpf_callx_targets.size());
++				for (const auto &callxTarget :
++				     vm.sbpf_callx_targets) {
++					auto destination = instBlocks.find(
++						callxTarget.instruction_pc);
++					if (destination == instBlocks.end()) {
++						return llvm::make_error<
++							llvm::StringError>(
++							"sBPF callx target is not a basic block",
++							llvm::inconvertibleErrorCode());
++					}
++					dispatch->addCase(
++						builder.getInt64(callxTarget.guest_address),
++						destination->second);
++				}
++				break;
++			}
+ 			// Call local function
+ 			if (inst.src == 0x1) {
+ 				if (kernel_compatible_mode) {
+@@ -1337,7 +1588,7 @@ this conversion.
+ 							llvm::inconvertibleErrorCode());
+ 					}
+ 					auto itr = kernelPseudoCallFunc.find(
+-						static_cast<uint16_t>(
++						static_cast<uint32_t>(
+ 							target_pc));
+ 					if (itr == kernelPseudoCallFunc.end()) {
+ 						return llvm::make_error<
+@@ -1376,7 +1627,7 @@ this conversion.
+ 				Value *nextPos = builder.CreateAdd(
+ 					builder.CreateLoad(builder.getInt64Ty(),
+ 							   callItemCnt),
+-					builder.getInt64(5));
++					builder.getInt64(6));
+ 				builder.CreateStore(nextPos, callItemCnt);
+ 				assert(localFuncRetBlks.contains(pc + 1));
+ 				// Store returning address
+@@ -1402,21 +1653,45 @@ this conversion.
+ 									i -
+ 									4)) }));
+ 				}
++				builder.CreateStore(
++					builder.CreateLoad(builder.getInt64Ty(), regs[10]),
++					builder.CreateGEP(
++						builder.getInt64Ty(), callStack,
++						{ builder.CreateSub(nextPos,
++								    builder.getInt64(6)) }));
+ 				// Move data stack
+ 				// r10 -= stackSize
+-				builder.CreateStore(
+-					builder.CreateSub(
+-						builder.CreateLoad(
+-							builder.getInt64Ty(),
+-							regs[10]),
+-						builder.getInt64(STACK_SIZE)),
+-					regs[10]);
++				if (!manual_stack_frames) {
++					builder.CreateStore(
++						builder.CreateSub(
++							builder.CreateLoad(
++								builder.getInt64Ty(), regs[10]),
++							builder.getInt64(EBPF_STACK_SIZE)),
++						regs[10]);
++				}
+ 				if (auto dstBlk = loadCallDstBlock(pc, inst,
+ 								   instBlocks);
+ 				    dstBlk) {
+ 					builder.CreateBr(dstBlk.get());
+ 				} else {
+-					return dstBlk.takeError();
++					// sBPF: an unresolved local-call target
++					// (e.g. a syscall the normalizer did not
++					// rewrite, mis-encoded as a bpf-to-bpf
++					// call) would otherwise abort the whole
++					// module. Trap it like an invalid callx:
++					// store the trap result in r0 and exit, so
++					// the rest of the program still lifts. A
++					// path that actually reaches it surfaces as
++					// a KLEE error rather than a lift failure.
++					llvm::consumeError(dstBlk.takeError());
++					auto *invalidResult = builder.CreateCall(
++						invalidCallxFuncTy,
++						invalidCallxFunc,
++						{ builder.getInt64(
++							(uint32_t)inst.imm) });
++					builder.CreateStore(invalidResult,
++							    regs[0]);
++					builder.CreateBr(exitBlk);
+ 				}
+ 
+ 			} else {
+diff --git a/src/compiler_utils.cpp b/src/compiler_utils.cpp
+index 4ca156b..c64327c 100644
+--- a/src/compiler_utils.cpp
++++ b/src/compiler_utils.cpp
+@@ -43,15 +43,18 @@ llvm::Value *emitLoadALUDest(const ebpf_inst &inst, llvm::Value **regs,
+ }
+ 
+ void emitStoreALUResult(const ebpf_inst &inst, llvm::Value **regs,
+-			llvm::IRBuilder<> &builder, llvm::Value *result)
++			llvm::IRBuilder<> &builder, llvm::Value *result,
++			bool sign_extend_alu32)
+ {
+ 	if ((inst.opcode & 0x07) == EBPF_CLS_ALU64) {
+ 		builder.CreateStore(result, regs[inst.dst]);
+ 	} else {
+ 		// For 32-bit ALU operations, clear the
+ 		// upper 32bits of the 64-bit register
+-		builder.CreateStore(builder.CreateZExt(result,
+-						       builder.getInt64Ty()),
++		builder.CreateStore(builder.CreateCast(
++					sign_extend_alu32 ? llvm::Instruction::SExt :
++							    llvm::Instruction::ZExt,
++					result, builder.getInt64Ty()),
+ 				    regs[inst.dst]);
+ 	}
+ }
+@@ -124,13 +127,14 @@ emitALUEndianConversion(const ebpf_inst &inst, llvm::IRBuilder<> &builder,
+ 
+ void emitALUWithDstAndSrc(
+ 	const ebpf_inst &inst, llvm::IRBuilder<> &builder, llvm::Value **regs,
+-	std::function<llvm::Value *(llvm::Value *, llvm::Value *)> func)
++	std::function<llvm::Value *(llvm::Value *, llvm::Value *)> func,
++	bool sign_extend_alu32)
+ {
+ 	using namespace llvm;
+ 	Value *dst_val = emitLoadALUDest(inst, &regs[0], builder, false);
+ 	Value *src_val = emitLoadALUSource(inst, &regs[0], builder);
+ 	Value *result = func(dst_val, src_val);
+-	emitStoreALUResult(inst, regs, builder, result);
++	emitStoreALUResult(inst, regs, builder, result, sign_extend_alu32);
+ }
+ 
+ llvm::Value *emitStoreLoadingSrc(const ebpf_inst &inst,
+@@ -195,13 +199,13 @@ emitJmpLoadSrcAndDstAndZero(const ebpf_inst &inst, llvm::Value **regs,
+ }
+ 
+ llvm::Expected<llvm::BasicBlock *>
+-loadJmpDstBlock(uint16_t pc, const ebpf_inst &inst,
+-		const std::map<uint16_t, llvm::BasicBlock *> &instBlocks,
++loadJmpDstBlock(uint32_t pc, const ebpf_inst &inst,
++		const std::map<uint32_t, llvm::BasicBlock *> &instBlocks,
+ 		bool useOffset)
+ {
+ 	SPDLOG_TRACE("pc {} request jump to {}", pc,
+ 		     pc + 1 + (useOffset ? inst.offset : inst.imm));
+-	uint16_t dstBlkId = pc + 1 + (useOffset ? inst.offset : inst.imm);
++	uint32_t dstBlkId = pc + 1 + (useOffset ? inst.offset : inst.imm);
+ 	if (auto itr = instBlocks.find(dstBlkId); itr != instBlocks.end()) {
+ 		return itr->second;
+ 	} else {
+@@ -214,10 +218,10 @@ loadJmpDstBlock(uint16_t pc, const ebpf_inst &inst,
+ }
+ 
+ llvm::Expected<llvm::BasicBlock *>
+-loadCallDstBlock(uint16_t pc, const ebpf_inst &inst,
+-		 const std::map<uint16_t, llvm::BasicBlock *> &instBlocks)
++loadCallDstBlock(uint32_t pc, const ebpf_inst &inst,
++		 const std::map<uint32_t, llvm::BasicBlock *> &instBlocks)
+ {
+-	uint16_t dstBlkId = pc + 1 + inst.imm;
++	uint32_t dstBlkId = pc + 1 + inst.imm;
+ 	if (auto itr = instBlocks.find(dstBlkId); itr != instBlocks.end()) {
+ 		return itr->second;
+ 	} else {
+@@ -230,10 +234,10 @@ loadCallDstBlock(uint16_t pc, const ebpf_inst &inst,
+ }
+ 
+ llvm::Expected<llvm::BasicBlock *>
+-loadJmpNextBlock(uint16_t pc, const ebpf_inst &inst,
+-		 const std::map<uint16_t, llvm::BasicBlock *> &instBlocks)
++loadJmpNextBlock(uint32_t pc, const ebpf_inst &inst,
++		 const std::map<uint32_t, llvm::BasicBlock *> &instBlocks)
+ {
+-	uint16_t nextBlkId = pc + 1;
++	uint32_t nextBlkId = pc + 1;
+ 	if (auto itr = instBlocks.find(nextBlkId); itr != instBlocks.end()) {
+ 		return itr->second;
+ 	} else {
+@@ -246,8 +250,8 @@ loadJmpNextBlock(uint16_t pc, const ebpf_inst &inst,
+ }
+ 
+ llvm::Expected<std::pair<llvm::BasicBlock *, llvm::BasicBlock *> >
+-localJmpDstAndNextBlk(uint16_t pc, const ebpf_inst &inst,
+-		      const std::map<uint16_t, llvm::BasicBlock *> &instBlocks)
++localJmpDstAndNextBlk(uint32_t pc, const ebpf_inst &inst,
++		      const std::map<uint32_t, llvm::BasicBlock *> &instBlocks)
+ {
+ 	if (auto dst = loadJmpDstBlock(pc, inst, instBlocks, true); dst) {
+ 		if (auto next = loadJmpNextBlock(pc, inst, instBlocks); next) {
+@@ -293,8 +297,8 @@ void emitLoadX(llvm::IRBuilder<> &builder, llvm::Value **regs,
+ }
+ 
+ llvm::Expected<int> emitCondJmpWithDstAndSrc(
+-	llvm::IRBuilder<> &builder, uint16_t pc, const ebpf_inst &inst,
+-	const std::map<uint16_t, llvm::BasicBlock *> &instBlocks,
++	llvm::IRBuilder<> &builder, uint32_t pc, const ebpf_inst &inst,
++	const std::map<uint32_t, llvm::BasicBlock *> &instBlocks,
+ 	llvm::Value **regs,
+ 	std::function<llvm::Value *(llvm::Value *, llvm::Value *)> func)
+ {
+@@ -313,7 +317,7 @@ llvm::Expected<int>
+ emitExtFuncCall(llvm::IRBuilder<> &builder, const ebpf_inst &inst,
+ 		std::map<std::string, llvm::Function *> &extFunc,
+ 		llvm::Value **regs, llvm::FunctionType *helperFuncTy,
+-		uint16_t pc, llvm::BasicBlock *exitBlk,
++		uint32_t pc, llvm::BasicBlock *exitBlk,
+ 		bool allow_implicit_external, bool kernel_compatible_mode)
+ {
+ 	auto funcNameToCall = ext_func_sym(inst.imm);
+@@ -357,9 +361,10 @@ emitExtFuncCall(llvm::IRBuilder<> &builder, const ebpf_inst &inst,
+ 			builder.CreateStore(callInst, regs[0]);
+ 		}
+ 
+-		// The userspace llvmbpf runtime does not implement real kernel tail
+-		// calls, so keep the historical "exit after helper 12" behavior there.
+-		if (inst.imm == 12 && !kernel_compatible_mode) {
++		// In sBPF, normalized helper index 12 is sol_get_clock_sysvar (not the
++		// kernel bpf_tail_call), so it returns normally: the historical
++		// exit-after-helper-12 behavior only applies to kernel-compatible mode.
++		if (inst.imm == 12 && kernel_compatible_mode) {
+ 			builder.CreateBr(exitBlk);
+ 		}
+ 		return 0;
+diff --git a/src/compiler_utils.hpp b/src/compiler_utils.hpp
+index 52a7c8f..d2a5ec9 100644
+--- a/src/compiler_utils.hpp
++++ b/src/compiler_utils.hpp
+@@ -54,14 +54,16 @@ llvm::Value *emitLoadALUSource(const ebpf_inst &inst, llvm::Value **regs,
+ llvm::Value *emitLoadALUDest(const ebpf_inst &inst, llvm::Value **regs,
+ 			     llvm::IRBuilder<> &builder, bool dstAlways64);
+ void emitStoreALUResult(const ebpf_inst &inst, llvm::Value **regs,
+-			llvm::IRBuilder<> &builder, llvm::Value *result);
++			llvm::IRBuilder<> &builder, llvm::Value *result,
++			bool sign_extend_alu32 = false);
+ llvm::Expected<llvm::Value *>
+ emitALUEndianConversion(const ebpf_inst &inst, llvm::IRBuilder<> &builder,
+ 			llvm::Value *dst_val);
+ 
+ void emitALUWithDstAndSrc(
+ 	const ebpf_inst &inst, llvm::IRBuilder<> &builder, llvm::Value **regs,
+-	std::function<llvm::Value *(llvm::Value *, llvm::Value *)> func);
++	std::function<llvm::Value *(llvm::Value *, llvm::Value *)> func,
++	bool sign_extend_alu32 = false);
+ 
+ llvm::Value *emitStoreLoadingSrc(const ebpf_inst &inst,
+ 				 llvm::IRBuilder<> &builder,
+@@ -77,18 +79,18 @@ emitJmpLoadSrcAndDstAndZero(const ebpf_inst &inst, llvm::Value **regs,
+ 			    llvm::IRBuilder<> &builder);
+ 
+ llvm::Expected<llvm::BasicBlock *>
+-loadJmpDstBlock(uint16_t pc, const ebpf_inst &inst,
+-		const std::map<uint16_t, llvm::BasicBlock *> &instBlocks,
++loadJmpDstBlock(uint32_t pc, const ebpf_inst &inst,
++		const std::map<uint32_t, llvm::BasicBlock *> &instBlocks,
+ 		bool useOffset);
+ llvm::Expected<llvm::BasicBlock *>
+-loadCallDstBlock(uint16_t pc, const ebpf_inst &inst,
+-		 const std::map<uint16_t, llvm::BasicBlock *> &instBlocks);
++loadCallDstBlock(uint32_t pc, const ebpf_inst &inst,
++		 const std::map<uint32_t, llvm::BasicBlock *> &instBlocks);
+ llvm::Expected<llvm::BasicBlock *>
+-loadJmpNextBlock(uint16_t pc, const ebpf_inst &inst,
+-		 const std::map<uint16_t, llvm::BasicBlock *> &instBlocks);
++loadJmpNextBlock(uint32_t pc, const ebpf_inst &inst,
++		 const std::map<uint32_t, llvm::BasicBlock *> &instBlocks);
+ llvm::Expected<std::pair<llvm::BasicBlock *, llvm::BasicBlock *> >
+-localJmpDstAndNextBlk(uint16_t pc, const ebpf_inst &inst,
+-		      const std::map<uint16_t, llvm::BasicBlock *> &instBlocks);
++localJmpDstAndNextBlk(uint32_t pc, const ebpf_inst &inst,
++		      const std::map<uint32_t, llvm::BasicBlock *> &instBlocks);
+ llvm::Value *emitLDXLoadingAddr(llvm::IRBuilder<> &builder, llvm::Value **regs,
+ 				const ebpf_inst &inst);
+ void emitLDXStoringResult(llvm::IRBuilder<> &builder, llvm::Value **regs,
+@@ -99,8 +101,8 @@ void emitLoadX(llvm::IRBuilder<> &builder, llvm::Value **regs,
+ 	       bool sign_extend = false);
+ 
+ llvm::Expected<int> emitCondJmpWithDstAndSrc(
+-	llvm::IRBuilder<> &builder, uint16_t pc, const ebpf_inst &inst,
+-	const std::map<uint16_t, llvm::BasicBlock *> &instBlocks,
++	llvm::IRBuilder<> &builder, uint32_t pc, const ebpf_inst &inst,
++	const std::map<uint32_t, llvm::BasicBlock *> &instBlocks,
+ 	llvm::Value **regs,
+ 	std::function<llvm::Value *(llvm::Value *, llvm::Value *)> func);
+ 
+@@ -108,7 +110,7 @@ llvm::Expected<int>
+ emitExtFuncCall(llvm::IRBuilder<> &builder, const ebpf_inst &inst,
+ 		std::map<std::string, llvm::Function *> &extFunc,
+ 		llvm::Value **regs, llvm::FunctionType *helperFuncTy,
+-		uint16_t pc, llvm::BasicBlock *exitBlk,
++		uint32_t pc, llvm::BasicBlock *exitBlk,
+ 		bool allow_implicit_external = false,
+ 		bool kernel_compatible_mode = false);
+ void emitAtomicBinOp(llvm::IRBuilder<> &builder, llvm::Value **regs,
+diff --git a/src/ebpf_inst.h b/src/ebpf_inst.h
+index 0fbbc7a..cdd0bc1 100644
+--- a/src/ebpf_inst.h
++++ b/src/ebpf_inst.h
+@@ -139,6 +139,35 @@ enum bpf_register {
+ #define EBPF_OP_BE (EBPF_CLS_ALU | EBPF_SRC_REG | EBPF_ALU_OP_END)
+ #define EBPF_OP_BYTESWAP (EBPF_CLS_ALU64 | EBPF_SRC_IMM | EBPF_ALU_OP_END)
+ 
++// Canonical private opcodes emitted by sbpf-normalize for SBPFv2 PQR.  The
++// deployed encodings collide with JMP32 and cannot be decoded without version
++// metadata, so the adapter assigns unused legacy-LD-class bytes.
++#define SBPF_OP_LMUL32_IMM 0x20
++#define SBPF_OP_LMUL32_REG 0x28
++#define SBPF_OP_LMUL64_IMM 0x30
++#define SBPF_OP_LMUL64_REG 0x38
++#define SBPF_OP_UHMUL64_IMM 0x40
++#define SBPF_OP_UHMUL64_REG 0x48
++#define SBPF_OP_SHMUL64_IMM 0x50
++#define SBPF_OP_SHMUL64_REG 0x58
++#define SBPF_OP_UDIV32_IMM 0x60
++#define SBPF_OP_UDIV32_REG 0x68
++#define SBPF_OP_UDIV64_IMM 0x70
++#define SBPF_OP_UDIV64_REG 0x78
++#define SBPF_OP_UREM32_IMM 0x80
++#define SBPF_OP_UREM32_REG 0x88
++#define SBPF_OP_UREM64_IMM 0x90
++#define SBPF_OP_UREM64_REG 0x98
++#define SBPF_OP_SDIV32_IMM 0xa0
++#define SBPF_OP_SDIV32_REG 0xa8
++#define SBPF_OP_SDIV64_IMM 0xb0
++#define SBPF_OP_SDIV64_REG 0xb8
++#define SBPF_OP_SREM32_IMM 0xc0
++#define SBPF_OP_SREM32_REG 0xc8
++#define SBPF_OP_SREM64_IMM 0xd0
++#define SBPF_OP_SREM64_REG 0xd8
++#define SBPF_OP_HOR64_IMM 0xf7
++
+ #define EBPF_OP_ADD64_IMM (EBPF_CLS_ALU64 | EBPF_SRC_IMM | EBPF_ALU_OP_ADD)
+ #define EBPF_OP_ADD64_REG (EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_ADD)
+ #define EBPF_OP_SUB64_IMM (EBPF_CLS_ALU64 | EBPF_SRC_IMM | EBPF_ALU_OP_SUB)
+diff --git a/src/vm.cpp b/src/vm.cpp
+index 3f8cbf1..5563f60 100644
+--- a/src/vm.cpp
++++ b/src/vm.cpp
+@@ -137,9 +137,44 @@ int llvmbpf_vm::load_code(const void *code, size_t code_len) noexcept
+ 	return 0;
+ }
+ 
++int llvmbpf_vm::set_sbpf_callx_targets(
++	const std::vector<sbpf_callx_target> &targets) noexcept
++{
++	for (const auto &target : targets) {
++		if (target.instruction_pc >= instructions.size()) {
++			error_msg = "sBPF callx target pc is outside loaded code";
++			return -1;
++		}
++	}
++	sbpf_callx_targets = targets;
++	return 0;
++}
++
++int llvmbpf_vm::set_sbpf_version(uint32_t version) noexcept
++{
++	if (version > 2) {
++		error_msg = "Only sBPF versions V0 through V2 are supported";
++		return -EINVAL;
++	}
++	sbpf_version = version;
++	return 0;
++}
++
++int llvmbpf_vm::set_entry_pc(uint32_t instruction_pc) noexcept
++{
++	if (instruction_pc >= instructions.size()) {
++		error_msg = "Entry PC is outside loaded code";
++		return -EINVAL;
++	}
++	entry_pc = instruction_pc;
++	return 0;
++}
++
+ void llvmbpf_vm::unload_code() noexcept
+ {
+ 	instructions.clear();
++	sbpf_callx_targets.clear();
++	entry_pc = 0;
+ }
+ 
+ int llvmbpf_vm::exec(void *mem, size_t mem_len,

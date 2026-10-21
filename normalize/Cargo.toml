@@ -1,0 +1,9 @@
+[package]
+name = "sbpf-normalize"
+version = "0.1.0"
+edition = "2021"
+default-run = "sbpf-normalize"
+
+[dependencies]
+solana-sbpf = "=0.21.1"
+
